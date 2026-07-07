@@ -1,6 +1,6 @@
 # jnx2mbtiles
 
-Converts Garmin BirdsEye raster maps (`.jnx`) to [MBTiles](https://github.com/mapbox/mbtiles-spec) (`.mbtiles` / SQLite), ready to use in any MBTiles-compatible viewer (OsmAnd, MAPS.ME, MapTiler, QGIS, etc.).
+Converts Garmin BirdsEye raster maps (`.jnx`) to [MBTiles](https://github.com/mapbox/mbtiles-spec) (`.mbtiles` / SQLite), ready to use in any MBTiles-compatible viewer (Gurumaps, AlpineQuest, OsmAnd, MAPS.ME, MapTiler, QGIS, etc.).
 
 ## Features
 
