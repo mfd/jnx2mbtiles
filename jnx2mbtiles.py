@@ -392,7 +392,9 @@ def convert(jnx_path, out_path, name=None, projection=None):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('jnx_path')
-    ap.add_argument('output_mbtiles')
+    ap.add_argument('output_mbtiles', nargs='?', default=None,
+                     help='Путь к выходному .mbtiles. Если не указан - берётся '
+                          'имя входного файла с заменой расширения на .mbtiles')
     ap.add_argument('--name', default=None)
     ap.add_argument('--projection', choices=['spherical', 'ellipsoidal'], default=None,
                      help='Задать проекцию явно вместо автоопределения по содержимому файла')
@@ -400,4 +402,10 @@ if __name__ == '__main__':
                      help='Подробный вывод (размер мозаики и т.п.) в дополнение к прогресс-барам')
     args = ap.parse_args()
     VERBOSE = args.verbose
-    convert(args.jnx_path, args.output_mbtiles, args.name, args.projection)
+
+    output_mbtiles = args.output_mbtiles
+    if output_mbtiles is None:
+        output_mbtiles = os.path.splitext(args.jnx_path)[0] + '.mbtiles'
+        log(f"Выходной файл не указан, использую: {output_mbtiles}")
+
+    convert(args.jnx_path, output_mbtiles, args.name, args.projection)

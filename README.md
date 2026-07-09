@@ -25,7 +25,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python3 jnx2mbtiles.py <input.jnx> <output.mbtiles> [--name "Map Name"] [--projection spherical|ellipsoidal] [--verbose]
+python3 jnx2mbtiles.py <input.jnx> [output.mbtiles] [--name "Map Name"] [--projection spherical|ellipsoidal] [--verbose]
 ```
 
 ### Arguments
@@ -33,7 +33,7 @@ python3 jnx2mbtiles.py <input.jnx> <output.mbtiles> [--name "Map Name"] [--proje
 | Argument | Description |
 |---|---|
 | `input.jnx` | Source Garmin JNX file |
-| `output.mbtiles` | Destination MBTiles file (must not exist) |
+| `output.mbtiles` | *(optional)* Destination MBTiles file (must not exist). If omitted, defaults to `input.mbtiles` — same name as the input file with the extension replaced |
 | `--name "..."` | Override the map name stored in metadata (defaults to the name embedded in the JNX) |
 | `--projection` | Force a specific projection instead of auto-detecting: `spherical` or `ellipsoidal` |
 | `--verbose`, `-v` | Print extra detail (mosaic size, memory usage, etc.) |
@@ -41,14 +41,17 @@ python3 jnx2mbtiles.py <input.jnx> <output.mbtiles> [--name "Map Name"] [--proje
 ### Examples
 
 ```bash
-# Auto-detect projection (recommended)
+# Auto-detect projection, output defaults to map.mbtiles
+python3 jnx2mbtiles.py map.jnx
+
+# Explicit output filename
 python3 jnx2mbtiles.py map.jnx map.mbtiles
 
 # Force ellipsoidal (Yandex Maps) projection
 python3 jnx2mbtiles.py yandex_sat.jnx yandex_sat.mbtiles --projection ellipsoidal --name "Yandex Satellite"
 
 # Verbose output
-python3 jnx2mbtiles.py map.jnx map.mbtiles -v
+python3 jnx2mbtiles.py map.jnx -v
 ```
 
 ## How it works
