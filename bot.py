@@ -79,18 +79,9 @@ def _schedule_download_cleanup(token: str) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _proc_mem():
-    """Возвращает (rss_мб, swap_мб, total_ram_мб, total_swap_мб). Читает /proc (Linux)."""
-    rss = swap = total_ram = total_swap = 0.0
-    try:
-        with open('/proc/self/status') as f:
-            for line in f:
-                if line.startswith('VmRSS:'):
-                    rss = int(line.split()[1]) / 1024
-                elif line.startswith('VmSwap:'):
-                    swap = int(line.split()[1]) / 1024
-    except Exception:
-        pass
+def _read_meminfo():
+    """Возвращает (total_ram_мб, total_swap_мб) из /proc/meminfo."""
+    total_ram = total_swap = 0.0
     try:
         with open('/proc/meminfo') as f:
             for line in f:
@@ -100,7 +91,64 @@ def _proc_mem():
                     total_swap = int(line.split()[1]) / 1024
     except Exception:
         pass
-    return rss, swap, total_ram, total_swap
+    return total_ram, total_swap
+
+
+class _MemSampler:
+    """Сэмплирует память каждые 0.5 с из cgroup v2 (точно как systemd).
+    Падбэк на /proc/self/status если cgroup недоступен."""
+
+    def __init__(self):
+        self.cur_ram = self.cur_swap = 0.0
+        self.peak_ram = self.peak_swap = 0.0
+        self._stop = threading.Event()
+        self._mem_file = self._swap_file = None
+        try:
+            with open('/proc/self/cgroup') as f:
+                for line in f:
+                    if line.startswith('0::'):
+                        base = '/sys/fs/cgroup' + line.strip()[3:]
+                        if os.path.exists(base + '/memory.current'):
+                            self._mem_file  = base + '/memory.current'
+                            self._swap_file = base + '/memory.swap.current'
+        except Exception:
+            pass
+
+    def _read(self, path):
+        try:
+            with open(path) as f:
+                return int(f.read()) / 1048576
+        except Exception:
+            return 0.0
+
+    def _sample(self):
+        if self._mem_file:
+            ram  = self._read(self._mem_file)
+            swap = self._read(self._swap_file) if self._swap_file else 0.0
+        else:
+            ram = swap = 0.0
+            try:
+                with open('/proc/self/status') as f:
+                    for line in f:
+                        if line.startswith('VmRSS:'):
+                            ram  = int(line.split()[1]) / 1024
+                        elif line.startswith('VmSwap:'):
+                            swap = int(line.split()[1]) / 1024
+            except Exception:
+                pass
+        self.cur_ram  = ram;  self.peak_ram  = max(self.peak_ram,  ram)
+        self.cur_swap = swap; self.peak_swap = max(self.peak_swap, swap)
+
+    def start(self):
+        self._stop.clear()
+        def _run():
+            while not self._stop.wait(0.5):
+                self._sample()
+            self._sample()  # финальный замер
+        threading.Thread(target=_run, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
 
 
 async def _safe_edit(msg, text: str) -> None:
@@ -142,8 +190,10 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         started = time.time()
         _last = [0.0]
         _lock = threading.Lock()
-        _level: dict = {}  # zoom, idx, total, projection — заполняется level_hook
-        _peak = {'rss': 0.0, 'swap': 0.0, 'total_ram': 0.0, 'total_swap': 0.0}
+        _level: dict = {}
+        total_ram, total_swap = _read_meminfo()
+        sampler = _MemSampler()
+        sampler.start()
 
         _PROJ_RU = {
             'spherical':    'сферическая (Google/OSM)',
@@ -166,16 +216,11 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             filled = max(1 if pct > 0 else 0, int(20 * pct))
             bar = '█' * filled + '░' * (20 - filled)
             elapsed = int(now - started)
-            rss, swap, total_ram, total_swap = _proc_mem()
-            _peak['rss'] = max(_peak['rss'], rss)
-            _peak['swap'] = max(_peak['swap'], swap)
-            _peak['total_ram'] = total_ram
-            _peak['total_swap'] = total_swap
-            proj = _level.get('proj', '…')
-            zoom = _level.get('zoom', '?')
+            proj    = _level.get('proj', '…')
+            zoom    = _level.get('zoom', '?')
             lvl_str = f"{_level['idx']}/{_level['total']}" if _level else '…'
-            ram_str  = f'RAM {rss:.0f}/{total_ram:.0f} МБ' if total_ram else f'RAM {rss:.0f} МБ'
-            swap_str = f'SWAP {swap:.0f}/{total_swap:.0f} МБ' if total_swap else f'SWAP {swap:.0f} МБ'
+            ram_str  = f'RAM {sampler.cur_ram:.0f}/{total_ram:.0f} МБ'  if total_ram  else f'RAM {sampler.cur_ram:.0f} МБ'
+            swap_str = f'SWAP {sampler.cur_swap:.0f}/{total_swap:.0f} МБ' if total_swap else f'SWAP {sampler.cur_swap:.0f} МБ'
             text = (
                 f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)\n'
                 f'Проекция: {proj}\n'
@@ -193,14 +238,12 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         finally:
             jnx2mbtiles.level_hook = None
             jnx2mbtiles.progress_hook = None
+            sampler.stop()
 
         elapsed = int(time.time() - started)
-        tr, ts = _peak['total_ram'], _peak['total_swap']
-        ram_str  = f'пик RAM {_peak["rss"]:.0f}/{tr:.0f} МБ' if tr else f'пик RAM {_peak["rss"]:.0f} МБ'
-        swap_str = f'пик SWAP {_peak["swap"]:.0f}/{ts:.0f} МБ' if ts else f'пик SWAP {_peak["swap"]:.0f} МБ'
-        conv_stats = (
-            f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  {ram_str}  {swap_str}'
-        )
+        ram_str  = f'пик RAM {sampler.peak_ram:.0f}/{total_ram:.0f} МБ'   if total_ram  else f'пик RAM {sampler.peak_ram:.0f} МБ'
+        swap_str = f'пик SWAP {sampler.peak_swap:.0f}/{total_swap:.0f} МБ' if total_swap else f'пик SWAP {sampler.peak_swap:.0f} МБ'
+        conv_stats = f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  {ram_str}  {swap_str}'
 
         out_mb = out_path.stat().st_size / 1024 / 1024
         await msg.edit_text(f'Отправляю {out_path.name} ({out_mb:.1f} МБ)…')
