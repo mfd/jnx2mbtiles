@@ -162,7 +162,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 f'Проекция: {proj}\n'
                 f'z={zoom} [{lvl_str}]  {prefix.strip()} [{bar}] {pct * 100:.0f}%\n'
                 f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  '
-                f'RAM {rss:.0f} МБ  swap {swap:.0f} МБ'
+                f'RAM {rss:.0f} МБ  SWAP {swap:.0f} МБ'
             )
             asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
 
