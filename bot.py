@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -75,6 +76,32 @@ def _schedule_download_cleanup(token: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _proc_mem():
+    """Возвращает (rss_мб, swap_мб) текущего процесса. Читает /proc/self/status (Linux)."""
+    rss = swap = 0.0
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    rss = int(line.split()[1]) / 1024
+                elif line.startswith('VmSwap:'):
+                    swap = int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return rss, swap
+
+
+async def _safe_edit(msg, text: str) -> None:
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
 
@@ -100,10 +127,36 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.edit_text(f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)…')
 
         loop = asyncio.get_event_loop()
+        started = time.time()
+        _last = [0.0]
+        _lock = threading.Lock()
+
+        def _on_progress(current, total, prefix=''):
+            now = time.time()
+            with _lock:
+                if now - _last[0] < 3.0:
+                    return
+                _last[0] = now
+            pct = current / total if total else 1.0
+            filled = int(20 * pct)
+            bar = '█' * filled + '░' * (20 - filled)
+            elapsed = int(now - started)
+            rss, swap = _proc_mem()
+            text = (
+                f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)…\n'
+                f'{prefix.strip()} [{bar}] {pct * 100:.0f}%\n'
+                f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  '
+                f'RAM {rss:.0f} МБ  swap {swap:.0f} МБ'
+            )
+            asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
+
+        jnx2mbtiles.progress_hook = _on_progress
         try:
             await loop.run_in_executor(None, _run_convert, str(jnx_path), str(out_path))
         except SystemExit as exc:
             raise RuntimeError(f'jnx2mbtiles завершился с кодом {exc.code}') from exc
+        finally:
+            jnx2mbtiles.progress_hook = None
 
         out_mb = out_path.stat().st_size / 1024 / 1024
         await msg.edit_text(f'Отправляю {out_path.name} ({out_mb:.1f} МБ)…')

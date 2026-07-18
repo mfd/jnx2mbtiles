@@ -34,10 +34,16 @@ SEMICIRCLE = 0x7FFFFFFF
 TILE_SIZE = 256
 
 VERBOSE = False  # управляется флагом --verbose
+progress_hook = None  # callable(current, total, prefix) — устанавливается извне
 
 
 def progress(current, total, prefix=''):
     """Однострочный прогресс-бар с обновлением через \\r (без доп. зависимостей)."""
+    if progress_hook is not None:
+        try:
+            progress_hook(current, total, prefix)
+        except Exception:
+            pass
     width = 30
     frac = current / total if total else 1.0
     filled = int(width * frac)
