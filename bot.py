@@ -42,6 +42,7 @@ EXPIRE_SECONDS = int(os.environ.get('EXPIRE_HOURS', 2)) * 3600
 EXPIRE_HOURS = EXPIRE_SECONDS // 3600
 
 _tmpdir = tempfile.mkdtemp(prefix='jnx2mb_')
+_conv_sem = asyncio.Semaphore(1)  # только одна конвертация одновременно
 
 # token -> {'out_path': Path, 'expires': float}
 _downloads: dict[str, dict] = {}
@@ -184,92 +185,97 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await tg_file.download_to_drive(jnx_path)
 
         size_mb = jnx_path.stat().st_size / 1024 / 1024
-        await msg.edit_text(f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)…')
 
-        loop = asyncio.get_event_loop()
-        started = time.time()
-        _last = [0.0]
-        _lock = threading.Lock()
-        _level: dict = {}
-        total_ram, total_swap = _read_meminfo()
-        sampler = _MemSampler()
-        sampler.start()
+        if _conv_sem.locked():
+            await msg.edit_text(f'Получено {doc.file_name} ({size_mb:.1f} МБ)\n⏳ Жду окончания предыдущей конвертации…')
 
-        _PROJ_RU = {
-            'spherical':    'сферическая (Google/OSM)',
-            'ellipsoidal':  'эллипсоидальная (Яндекс)',
-        }
+        async with _conv_sem:
+            await msg.edit_text(f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)…')
 
-        def _on_level(zoom, level_idx, total_levels, projection):
-            _level['zoom'] = zoom
-            _level['idx'] = level_idx + 1
-            _level['total'] = total_levels
-            _level['proj'] = _PROJ_RU.get(projection, projection)
+            loop = asyncio.get_event_loop()
+            started = time.time()
+            _last = [0.0]
+            _lock = threading.Lock()
+            _level: dict = {}
+            total_ram, total_swap = _read_meminfo()
+            sampler = _MemSampler()
+            sampler.start()
 
-        def _on_progress(current, total, prefix=''):
-            now = time.time()
-            with _lock:
-                if now - _last[0] < 3.0:
-                    return
-                _last[0] = now
-            pct = current / total if total else 1.0
-            filled = max(1 if pct > 0 else 0, int(20 * pct))
-            bar = '█' * filled + '░' * (20 - filled)
-            elapsed = int(now - started)
-            proj    = _level.get('proj', '…')
-            zoom    = _level.get('zoom', '?')
-            lvl_str = f"{_level['idx']}/{_level['total']}" if _level else '…'
-            ram_str  = f'RAM {sampler.cur_ram:.0f}/{total_ram:.0f} МБ'  if total_ram  else f'RAM {sampler.cur_ram:.0f} МБ'
-            swap_str = f'SWAP {sampler.cur_swap:.0f}/{total_swap:.0f} МБ' if total_swap else f'SWAP {sampler.cur_swap:.0f} МБ'
-            text = (
-                f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)\n'
-                f'Проекция: {proj}\n'
-                f'z={zoom} [{lvl_str}]  {prefix.strip()} [{bar}] {pct * 100:.0f}%\n'
-                f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  {ram_str}  {swap_str}'
-            )
-            asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
+            _PROJ_RU = {
+                'spherical':    'сферическая (Google/OSM)',
+                'ellipsoidal':  'эллипсоидальная (Яндекс)',
+            }
 
-        jnx2mbtiles.level_hook = _on_level
-        jnx2mbtiles.progress_hook = _on_progress
-        try:
-            await loop.run_in_executor(None, _run_convert, str(jnx_path), str(out_path))
-        except SystemExit as exc:
-            raise RuntimeError(f'jnx2mbtiles завершился с кодом {exc.code}') from exc
-        finally:
-            jnx2mbtiles.level_hook = None
-            jnx2mbtiles.progress_hook = None
-            sampler.stop()
+            def _on_level(zoom, level_idx, total_levels, projection):
+                _level['zoom'] = zoom
+                _level['idx'] = level_idx + 1
+                _level['total'] = total_levels
+                _level['proj'] = _PROJ_RU.get(projection, projection)
 
-        elapsed = int(time.time() - started)
-        ram_str  = f'пик RAM {sampler.peak_ram:.0f}/{total_ram:.0f} МБ'   if total_ram  else f'пик RAM {sampler.peak_ram:.0f} МБ'
-        swap_str = f'пик SWAP {sampler.peak_swap:.0f}/{total_swap:.0f} МБ' if total_swap else f'пик SWAP {sampler.peak_swap:.0f} МБ'
-        conv_stats = f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  {ram_str}  {swap_str}'
+            def _on_progress(current, total, prefix=''):
+                now = time.time()
+                with _lock:
+                    if now - _last[0] < 3.0:
+                        return
+                    _last[0] = now
+                pct = current / total if total else 1.0
+                filled = max(1 if pct > 0 else 0, int(20 * pct))
+                bar = '█' * filled + '░' * (20 - filled)
+                elapsed = int(now - started)
+                proj    = _level.get('proj', '…')
+                zoom    = _level.get('zoom', '?')
+                lvl_str = f"{_level['idx']}/{_level['total']}" if _level else '…'
+                ram_str  = f'RAM {sampler.cur_ram:.0f}/{total_ram:.0f} МБ'  if total_ram  else f'RAM {sampler.cur_ram:.0f} МБ'
+                swap_str = f'SWAP {sampler.cur_swap:.0f}/{total_swap:.0f} МБ' if total_swap else f'SWAP {sampler.cur_swap:.0f} МБ'
+                text = (
+                    f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)\n'
+                    f'Проекция: {proj}\n'
+                    f'z={zoom} [{lvl_str}]  {prefix.strip()} [{bar}] {pct * 100:.0f}%\n'
+                    f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  {ram_str}  {swap_str}'
+                )
+                asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
 
-        out_mb = out_path.stat().st_size / 1024 / 1024
-        await msg.edit_text(f'Отправляю {out_path.name} ({out_mb:.1f} МБ)…')
+            jnx2mbtiles.level_hook = _on_level
+            jnx2mbtiles.progress_hook = _on_progress
+            try:
+                await loop.run_in_executor(None, _run_convert, str(jnx_path), str(out_path))
+            except SystemExit as exc:
+                raise RuntimeError(f'jnx2mbtiles завершился с кодом {exc.code}') from exc
+            finally:
+                jnx2mbtiles.level_hook = None
+                jnx2mbtiles.progress_hook = None
+                sampler.stop()
 
-        with open(out_path, 'rb') as fh:
-            await ctx.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=fh,
-                filename=out_path.name,
-                caption=conv_stats,
-            )
-        await msg.delete()
-        logger.info('Done: %s → %s (%.1f MB)', doc.file_name, out_path.name, out_mb)
+            elapsed = int(time.time() - started)
+            ram_str  = f'пик RAM {sampler.peak_ram:.0f}/{total_ram:.0f} МБ'   if total_ram  else f'пик RAM {sampler.peak_ram:.0f} МБ'
+            swap_str = f'пик SWAP {sampler.peak_swap:.0f}/{total_swap:.0f} МБ' if total_swap else f'пик SWAP {sampler.peak_swap:.0f} МБ'
+            conv_stats = f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  {ram_str}  {swap_str}'
 
-        if VPS_URL:
-            token = uuid.uuid4().hex
-            _downloads[token] = {'out_path': out_path, 'expires': time.time() + EXPIRE_SECONDS}
-            dl_url = f'{VPS_URL}/download/{token}/{out_path.name}'
-            await ctx.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f'Ссылка для скачивания (действует {EXPIRE_HOURS}ч):\n`{dl_url}`\n\n{conv_stats}',
-                parse_mode='Markdown',
-            )
-            loop.call_later(EXPIRE_SECONDS, _schedule_download_cleanup, token)
-        else:
-            out_path.unlink(missing_ok=True)
+            out_mb = out_path.stat().st_size / 1024 / 1024
+            await msg.edit_text(f'Отправляю {out_path.name} ({out_mb:.1f} МБ)…')
+
+            with open(out_path, 'rb') as fh:
+                await ctx.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=fh,
+                    filename=out_path.name,
+                    caption=conv_stats,
+                )
+            await msg.delete()
+            logger.info('Done: %s → %s (%.1f MB)', doc.file_name, out_path.name, out_mb)
+
+            if VPS_URL:
+                token = uuid.uuid4().hex
+                _downloads[token] = {'out_path': out_path, 'expires': time.time() + EXPIRE_SECONDS}
+                dl_url = f'{VPS_URL}/download/{token}/{out_path.name}'
+                await ctx.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f'Ссылка для скачивания (действует {EXPIRE_HOURS}ч):\n`{dl_url}`\n\n{conv_stats}',
+                    parse_mode='Markdown',
+                )
+                loop.call_later(EXPIRE_SECONDS, _schedule_download_cleanup, token)
+            else:
+                out_path.unlink(missing_ok=True)
 
     except Exception as exc:
         logger.exception('Failed for %s', doc.file_name)
