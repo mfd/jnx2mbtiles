@@ -80,8 +80,8 @@ def _schedule_download_cleanup(token: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _proc_mem():
-    """Возвращает (rss_мб, swap_мб) текущего процесса. Читает /proc/self/status (Linux)."""
-    rss = swap = 0.0
+    """Возвращает (rss_мб, swap_мб, total_ram_мб, total_swap_мб). Читает /proc (Linux)."""
+    rss = swap = total_ram = total_swap = 0.0
     try:
         with open('/proc/self/status') as f:
             for line in f:
@@ -91,7 +91,16 @@ def _proc_mem():
                     swap = int(line.split()[1]) / 1024
     except Exception:
         pass
-    return rss, swap
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    total_ram = int(line.split()[1]) / 1024
+                elif line.startswith('SwapTotal:'):
+                    total_swap = int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return rss, swap, total_ram, total_swap
 
 
 async def _safe_edit(msg, text: str) -> None:
@@ -131,7 +140,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         _last = [0.0]
         _lock = threading.Lock()
         _level: dict = {}  # zoom, idx, total, projection — заполняется level_hook
-        _peak = {'rss': 0.0, 'swap': 0.0}
+        _peak = {'rss': 0.0, 'swap': 0.0, 'total_ram': 0.0, 'total_swap': 0.0}
 
         _PROJ_RU = {
             'spherical':    'сферическая (Google/OSM)',
@@ -154,18 +163,21 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             filled = max(1 if pct > 0 else 0, int(20 * pct))
             bar = '█' * filled + '░' * (20 - filled)
             elapsed = int(now - started)
-            rss, swap = _proc_mem()
+            rss, swap, total_ram, total_swap = _proc_mem()
             _peak['rss'] = max(_peak['rss'], rss)
             _peak['swap'] = max(_peak['swap'], swap)
+            _peak['total_ram'] = total_ram
+            _peak['total_swap'] = total_swap
             proj = _level.get('proj', '…')
             zoom = _level.get('zoom', '?')
             lvl_str = f"{_level['idx']}/{_level['total']}" if _level else '…'
+            ram_str  = f'RAM {rss:.0f}/{total_ram:.0f} МБ' if total_ram else f'RAM {rss:.0f} МБ'
+            swap_str = f'SWAP {swap:.0f}/{total_swap:.0f} МБ' if total_swap else f'SWAP {swap:.0f} МБ'
             text = (
                 f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)\n'
                 f'Проекция: {proj}\n'
                 f'z={zoom} [{lvl_str}]  {prefix.strip()} [{bar}] {pct * 100:.0f}%\n'
-                f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  '
-                f'RAM {rss:.0f} МБ  SWAP {swap:.0f} МБ'
+                f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  {ram_str}  {swap_str}'
             )
             asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
 
@@ -180,9 +192,11 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             jnx2mbtiles.progress_hook = None
 
         elapsed = int(time.time() - started)
+        tr, ts = _peak['total_ram'], _peak['total_swap']
+        ram_str  = f'пик RAM {_peak["rss"]:.0f}/{tr:.0f} МБ' if tr else f'пик RAM {_peak["rss"]:.0f} МБ'
+        swap_str = f'пик SWAP {_peak["swap"]:.0f}/{ts:.0f} МБ' if ts else f'пик SWAP {_peak["swap"]:.0f} МБ'
         conv_stats = (
-            f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  '
-            f'пик RAM {_peak["rss"]:.0f} МБ  пик SWAP {_peak["swap"]:.0f} МБ'
+            f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  {ram_str}  {swap_str}'
         )
 
         out_mb = out_path.stat().st_size / 1024 / 1024
