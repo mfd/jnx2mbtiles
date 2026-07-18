@@ -1,69 +1,143 @@
-# Telegram-бот — деплой на Oracle Cloud Free Tier
+# Деплой бота на VPS — инструкция с нуля
 
-`bot.py` принимает `.jnx`, конвертирует в `.mbtiles` и возвращает ссылку на скачивание.  
-Файлы передаются **напрямую по HTTP** в обход Telegram — никаких ограничений по размеру.
-
-## Как это работает
+Бот принимает `.jnx` файл прямо в Telegram, конвертирует в `.mbtiles` и отправляет обратно.  
+Работает с телефона — curl не нужен.
 
 ```
-Пользователь                    VPS (Oracle Cloud)
-─────────────                   ──────────────────
-/convert          ──Telegram──▶  генерирует токен, отдаёт curl-команду
-curl -T file.jnx  ────HTTP────▶  принимает файл (любой размер)
-                                 конвертирует jnx → mbtiles
-                  ◀──Telegram──  ссылка на скачивание
-curl -OJ <url>    ◀───HTTP────   отдаёт .mbtiles
+Пользователь         VPS
+────────────         ───
+отправить .jnx  ──▶  скачать → конвертировать → отправить .mbtiles
+получить .mbtiles ◀──
 ```
 
-Временные файлы хранятся N часов (по умолчанию 2), затем удаляются автоматически.
-
-## Переменные окружения
-
-| Переменная | Обязательная | Описание |
-|---|---|---|
-| `BOT_TOKEN` | да | Токен бота от [@BotFather](https://t.me/BotFather) |
-| `VPS_URL` | да | Публичный адрес VPS, например `http://1.2.3.4:8080` |
-| `HTTP_PORT` | нет | Порт встроенного HTTP-сервера (по умолчанию `8080`) |
-| `EXPIRE_HOURS` | нет | Сколько часов хранить готовый файл (по умолчанию `2`) |
+Лимит по умолчанию в Telegram Bot API — 50 МБ. Чтобы снять его до 2 ГБ, на VPS запускается локальный Bot API сервер (`telegram-bot-api`).
 
 ---
 
-## Деплой на Oracle Cloud Free Tier
-
-### 1. Создать инстанс
-
-Oracle Cloud → Compute → Instances → Create
-
-- Shape: **Ampere A1** (ARM, до 4 OCPU + 24 ГБ RAM — бесплатно навсегда)
-- OS: Ubuntu 22.04
-
-### 2. Открыть порт 8080
-
-В Oracle Cloud есть два места, где нужно разрешить трафик.
-
-**Security List** (Oracle Cloud Console):  
-Networking → Virtual Cloud Networks → ваш VCN → Security Lists → Default →  
-Ingress Rules → Add:
-- Source: `0.0.0.0/0`
-- Protocol: TCP
-- Destination port: `8080`
-
-**Брандмауэр на самом сервере:**
-```bash
-sudo iptables -I INPUT -p tcp --dport 8080 -j ACCEPT
-sudo netfilter-persistent save   # сохранить между перезагрузками
-```
-
-### 3. Установить зависимости
+## Шаг 1. Зайти на VPS
 
 ```bash
-sudo apt update && sudo apt install -y python3-pip git
-git clone https://github.com/mfd/jnx2mbtiles.git
-cd jnx2mbtiles
-pip3 install -r requirements.txt
+ssh ubuntu@<публичный-IP>
 ```
 
-### 4. Создать systemd-сервис
+---
+
+## Шаг 2. Установить зависимости системы
+
+```bash
+sudo apt update && sudo apt install -y \
+  python3-pip python3-venv git \
+  make cmake g++ gperf zlib1g-dev libssl-dev
+```
+
+---
+
+## Шаг 3. Собрать telegram-bot-api
+
+Официальный локальный Bot API сервер от Telegram. Снимает ограничение 50 МБ.
+
+```bash
+git clone --recursive https://github.com/tdlib/telegram-bot-api.git ~/telegram-bot-api
+cd ~/telegram-bot-api
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . --target telegram-bot-api
+sudo cp telegram-bot-api /usr/local/bin/
+cd ~
+```
+
+> Сборка занимает ~10–15 минут на ARM (Oracle Ampere A1).
+
+---
+
+## Шаг 4. Получить api_id и api_hash
+
+1. Открыть **my.telegram.org** → Log in → API development tools
+2. Создать приложение (название любое)
+3. Скопировать **App api_id** и **App api_hash**
+
+---
+
+## Шаг 5. Запустить telegram-bot-api как сервис
+
+```bash
+sudo mkdir -p /var/lib/telegram-bot-api
+sudo chown ubuntu:ubuntu /var/lib/telegram-bot-api
+sudo nano /etc/systemd/system/telegram-bot-api.service
+```
+
+Вставить (заменить `YOUR_API_ID` и `YOUR_API_HASH`):
+
+```ini
+[Unit]
+Description=Telegram Bot API Server
+After=network.target
+
+[Service]
+User=ubuntu
+ExecStart=/usr/local/bin/telegram-bot-api \
+  --api-id=YOUR_API_ID \
+  --api-hash=YOUR_API_HASH \
+  --local \
+  --http-port=8081 \
+  --dir=/var/lib/telegram-bot-api
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-bot-api
+```
+
+Проверить:
+```bash
+sudo journalctl -fu telegram-bot-api
+# должно быть: Listening on port 8081
+```
+
+---
+
+## Шаг 6. Склонировать репозиторий
+
+```bash
+cd ~
+git clone https://github.com/your-user/jnx2mb.git
+cd jnx2mb
+```
+
+---
+
+## Шаг 7. Установить Python-пакеты
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## Шаг 8. Заполнить .env
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+```env
+BOT_TOKEN=<токен от @BotFather>
+LOCAL_API_URL=http://localhost:8081
+```
+
+`Ctrl+O` → Enter → `Ctrl+X`
+
+---
+
+## Шаг 9. Запустить бота как сервис
 
 ```bash
 sudo nano /etc/systemd/system/jnx2mb-bot.service
@@ -72,14 +146,13 @@ sudo nano /etc/systemd/system/jnx2mb-bot.service
 ```ini
 [Unit]
 Description=jnx2mbtiles Telegram Bot
-After=network.target
+After=network.target telegram-bot-api.service
 
 [Service]
 User=ubuntu
-WorkingDirectory=/home/ubuntu/jnx2mbtiles
-Environment="BOT_TOKEN=<токен от BotFather>"
-Environment="VPS_URL=http://<публичный IP>:8080"
-ExecStart=python3 bot.py
+WorkingDirectory=/home/ubuntu/jnx2mb
+EnvironmentFile=/home/ubuntu/jnx2mb/.env
+ExecStart=/home/ubuntu/jnx2mb/venv/bin/python3 bot.py
 Restart=always
 RestartSec=5
 
@@ -92,29 +165,34 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now jnx2mb-bot
 ```
 
-### 5. Проверить логи
+---
+
+## Шаг 10. Проверить
 
 ```bash
 sudo journalctl -fu jnx2mb-bot
+# должно быть:
+# Using local Bot API server: http://localhost:8081
+# Bot polling started
+```
+
+Написать боту `/start` → отправить `.jnx` файл → получить `.mbtiles`.
+
+---
+
+## Управление
+
+```bash
+sudo systemctl restart jnx2mb-bot        # перезапустить (после изменения .env)
+sudo journalctl -fu jnx2mb-bot           # логи бота
+sudo journalctl -fu telegram-bot-api     # логи API сервера
 ```
 
 ---
 
-## Использование
+## Переменные окружения
 
-В Telegram:
-```
-/convert
-```
-
-Бот ответит командой для загрузки. Выполнить на своём компьютере:
-```bash
-curl -T mymap.jnx http://<ip>:8080/upload/<token>/mymap.jnx
-```
-
-Когда конвертация закончится, бот пришлёт ссылку. Скачать:
-```bash
-curl -OJ http://<ip>:8080/download/<token>/mymap.mbtiles
-```
-
-Или просто открыть ссылку в браузере.
+| Переменная | Обязательная | Описание |
+|---|---|---|
+| `BOT_TOKEN` | да | Токен от [@BotFather](https://t.me/BotFather) |
+| `LOCAL_API_URL` | нет | Адрес локального Bot API сервера. Без него лимит файла — 50 МБ |

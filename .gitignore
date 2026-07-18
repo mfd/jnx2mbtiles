@@ -1,4 +1,5 @@
 env/
+.env
 *.jnx
 *.mbtiles
 .DS_Store
