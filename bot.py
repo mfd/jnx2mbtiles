@@ -91,6 +91,8 @@ async def run_all() -> None:
         builder = builder.base_url(f'{LOCAL_API_URL}/bot').local_mode(True)
         logger.info('Using local Bot API server: %s', LOCAL_API_URL)
 
+    builder = builder.read_timeout(120).write_timeout(120).connect_timeout(30).pool_timeout(120)
+
     app = builder.build()
     app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
