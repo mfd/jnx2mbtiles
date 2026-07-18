@@ -131,6 +131,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         _last = [0.0]
         _lock = threading.Lock()
         _level: dict = {}  # zoom, idx, total, projection — заполняется level_hook
+        _peak = {'rss': 0.0, 'swap': 0.0}
 
         _PROJ_RU = {
             'spherical':    'сферическая (Google/OSM)',
@@ -154,6 +155,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             bar = '█' * filled + '░' * (20 - filled)
             elapsed = int(now - started)
             rss, swap = _proc_mem()
+            _peak['rss'] = max(_peak['rss'], rss)
+            _peak['swap'] = max(_peak['swap'], swap)
             proj = _level.get('proj', '…')
             zoom = _level.get('zoom', '?')
             lvl_str = f"{_level['idx']}/{_level['total']}" if _level else '…'
@@ -176,6 +179,12 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             jnx2mbtiles.level_hook = None
             jnx2mbtiles.progress_hook = None
 
+        elapsed = int(time.time() - started)
+        conv_stats = (
+            f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  '
+            f'пик RAM {_peak["rss"]:.0f} МБ  пик SWAP {_peak["swap"]:.0f} МБ'
+        )
+
         out_mb = out_path.stat().st_size / 1024 / 1024
         await msg.edit_text(f'Отправляю {out_path.name} ({out_mb:.1f} МБ)…')
 
@@ -184,6 +193,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 chat_id=update.effective_chat.id,
                 document=fh,
                 filename=out_path.name,
+                caption=conv_stats,
             )
         await msg.delete()
         logger.info('Done: %s → %s (%.1f MB)', doc.file_name, out_path.name, out_mb)
@@ -194,7 +204,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             dl_url = f'{VPS_URL}/download/{token}/{out_path.name}'
             await ctx.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f'Ссылка для скачивания (действует {EXPIRE_HOURS}ч):\n`{dl_url}`',
+                text=f'Ссылка для скачивания (действует {EXPIRE_HOURS}ч):\n`{dl_url}`\n\n{conv_stats}',
                 parse_mode='Markdown',
             )
             loop.call_later(EXPIRE_SECONDS, _schedule_download_cleanup, token)
