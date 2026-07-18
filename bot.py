@@ -117,7 +117,7 @@ async def _safe_edit(msg, text: str) -> None:
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         'Пришлите .jnx файл — получите .mbtiles.\n'
-        '.jnx (Garmin) → .mbtiles (OruxMaps, GuruMaps)'
+        '.jnx (Garmin) → .mbtiles (Gurumaps, AlpineQuest, OsmAnd, MAPS.ME, MapTiler, QGIS, …)'
     )
 
 
