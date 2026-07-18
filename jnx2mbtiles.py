@@ -19,6 +19,7 @@ jnx2mbtiles.py - конвертирует Garmin .jnx в .mbtiles (SQLite), ав
 """
 
 import argparse
+import gc
 import io
 import math
 import os
@@ -236,90 +237,159 @@ def build_level(conn, jnx_path, level, projection, progress_every=200):
     total_in = len(tiles)
     log(f"Уровень z={zoom}: тайлов на входе {total_in}")
 
-    placed = []
-    with open(jnx_path, 'rb') as f:
-        for idx, t in enumerate(tiles, 1):
-            x_f, y_f = latlon_to_tile_xy(t['top'], t['left'], zoom, projection)
-            x, y = round(x_f), round(y_f)
-            f.seek(t['offset'])
-            jpeg = b'\xff\xd8' + f.read(t['size'])
-            placed.append((x, y, jpeg))
-            progress(idx, total_in, prefix='  чтение     ')
-
     if projection == 'spherical':
-        # быстрый путь - без ресемплинга, тайлы уже на нужной сетке
+        # Быстрый путь: каждый тайл читается и сразу пишется, без накопления в памяти.
         total = 0
-        for idx, (x, y, jpeg) in enumerate(placed, 1):
-            tms_row = (2 ** zoom - 1) - y
-            conn.execute(
-                "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-                (zoom, x, tms_row, sqlite3.Binary(jpeg))
-            )
-            total += 1
-            progress(idx, len(placed), prefix='  запись     ')
+        with open(jnx_path, 'rb') as f:
+            for idx, t in enumerate(tiles, 1):
+                x_f, y_f = latlon_to_tile_xy(t['top'], t['left'], zoom, projection)
+                x, y = round(x_f), round(y_f)
+                f.seek(t['offset'])
+                jpeg = b'\xff\xd8' + f.read(t['size'])
+                tms_row = (2 ** zoom - 1) - y
+                conn.execute(
+                    "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+                    (zoom, x, tms_row, sqlite3.Binary(jpeg))
+                )
+                total += 1
+                progress(idx, total_in, prefix='  запись     ')
         return total
 
-    # --- нестандартная проекция: собираем мозаику ИСХОДНИКА (uint8, один раз) ---
-    xs, ys = [p[0] for p in placed], [p[1] for p in placed]
+    # --- Эллипсоидальная проекция ---
+    #
+    # Вместо полной мозаики (которая на z17 занимала ~900 МБ виртуальной памяти)
+    # строим индекс тайлов без загрузки данных, затем на каждую полосу выходных
+    # тайлов подгружаем ровно 1–2 ряда исходных тайлов, строим мини-мозаику,
+    # перепроецируем, пишем в БД и сразу освобождаем.
+    #
+    # Пиковая память на z17 (~70×70 тайлов):
+    #   старый код:  ~900 МБ (полная мозаика) + списки placed
+    #   новый код:   ~30–40 МБ (2 ряда в кеше + мини-мозаика + полоса)
+
+    # (x, y) -> (file_offset, data_size)  — без загрузки JPEG
+    tile_index: dict = {}
+    for t in tiles:
+        x_f, y_f = latlon_to_tile_xy(t['top'], t['left'], zoom, 'ellipsoidal')
+        tile_index[(round(x_f), round(y_f))] = (t['offset'], t['size'])
+
+    xs = [k[0] for k in tile_index]
+    ys = [k[1] for k in tile_index]
     min_x, max_x = min(xs), max(xs)
     min_y_src, max_y_src = min(ys), max(ys)
-
     w_tiles = max_x - min_x + 1
     h_tiles_src = max_y_src - min_y_src + 1
-    mosaic = np.zeros((h_tiles_src * TILE_SIZE, w_tiles * TILE_SIZE, 3), dtype=np.uint8)
-    mask = np.zeros((h_tiles_src * TILE_SIZE, w_tiles * TILE_SIZE), dtype=bool)
-
-    for idx, (x, y, jpeg) in enumerate(placed, 1):
-        img = np.array(Image.open(io.BytesIO(jpeg)).convert('RGB'))
-        row0, col0 = (y - min_y_src) * TILE_SIZE, (x - min_x) * TILE_SIZE
-        mosaic[row0:row0 + TILE_SIZE, col0:col0 + TILE_SIZE] = img
-        mask[row0:row0 + TILE_SIZE, col0:col0 + TILE_SIZE] = True
-        progress(idx, len(placed), prefix='  сборка     ')
-    log_verbose(f"  мозаика {w_tiles}x{h_tiles_src} тайлов, {mosaic.nbytes / 1e6:.0f} МБ")
 
     lat_north = ellip_y_to_lat(min_y_src, zoom)
     lat_south = ellip_y_to_lat(max_y_src + 1, zoom)
-    y_sph_north = sph_lat_to_y(lat_north, zoom)
-    y_sph_south = sph_lat_to_y(lat_south, zoom)
-    min_y_tgt = math.floor(y_sph_north)
-    max_y_tgt = math.ceil(y_sph_south) - 1
+    min_y_tgt = math.floor(sph_lat_to_y(lat_north, zoom))
+    max_y_tgt = math.ceil(sph_lat_to_y(lat_south, zoom)) - 1
     h_tiles_tgt = max_y_tgt - min_y_tgt + 1
 
-    # --- перепроекция ПОЛОСАМИ по 256 строк (=1 ряд выходных тайлов), а не всей
-    # мозаикой сразу - иначе временные float32-массивы на больших уровнях (z16+)
-    # съедают несколько гигабайт памяти и всё подвисает ---
+    log_verbose(f"  мозаика {w_tiles}x{h_tiles_src} тайлов (ист.) -> {w_tiles}x{h_tiles_tgt} (цель)")
+
+    # Кеш декодированных исходных тайлов: (x_abs, y_abs) -> ndarray | None
+    # Хранит только те ряды, что нужны для текущей полосы; остальные вытесняются.
+    src_cache: dict = {}
     total = 0
-    for j in range(h_tiles_tgt):
-        row_start = j * TILE_SIZE
-        out_rows = np.arange(row_start, row_start + TILE_SIZE)
-        y_sph_frac = min_y_tgt + out_rows / TILE_SIZE
-        lats = [sph_y_to_lat(v, zoom) for v in y_sph_frac]
-        y_src_frac = np.array([ellip_lat_to_y(lat, zoom) for lat in lats])
-        src_row_f = np.clip((y_src_frac - min_y_src) * TILE_SIZE, 0, mosaic.shape[0] - 1.001)
-        row_lo = np.floor(src_row_f).astype(int)
-        row_hi = np.clip(row_lo + 1, 0, mosaic.shape[0] - 1)
-        frac = (src_row_f - row_lo)[:, None, None]
 
-        band = (mosaic[row_lo].astype(np.float32) * (1 - frac) +
-                mosaic[row_hi].astype(np.float32) * frac).astype(np.uint8)
-        band_mask = mask[row_lo] | mask[row_hi]
+    with open(jnx_path, 'rb') as jnx_f:
+        for j in range(h_tiles_tgt):
+            # Пиксельные строки выходного ряда тайлов j → сферические координаты
+            out_pix = np.arange(j * TILE_SIZE, (j + 1) * TILE_SIZE)
+            y_sph = min_y_tgt + out_pix / TILE_SIZE
+            lats = [sph_y_to_lat(float(v), zoom) for v in y_sph]
+            y_src = np.array([ellip_lat_to_y(lat, zoom) for lat in lats])
 
-        for i in range(w_tiles):
-            block = band[:, i * TILE_SIZE:(i + 1) * TILE_SIZE]
-            block_mask = band_mask[:, i * TILE_SIZE:(i + 1) * TILE_SIZE]
-            if not block_mask.any():
-                continue
-            x_abs, y_abs = min_x + i, min_y_tgt + j
-            buf = io.BytesIO()
-            Image.fromarray(block).save(buf, format='JPEG', quality=88)
-            tms_row = (2 ** zoom - 1) - y_abs
-            conn.execute(
-                "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-                (zoom, x_abs, tms_row, sqlite3.Binary(buf.getvalue()))
+            # Пиксельные строки в пространстве исходной (эллипсоидальной) мозаики
+            src_pix_f = np.clip(
+                (y_src - min_y_src) * TILE_SIZE,
+                0, h_tiles_src * TILE_SIZE - 1.001,
             )
-            total += 1
-        progress(j + 1, h_tiles_tgt, prefix='  перепроекция')
+            row_lo = np.floor(src_pix_f).astype(np.int32)
+            row_hi = np.clip(row_lo + 1, 0, h_tiles_src * TILE_SIZE - 1).astype(np.int32)
+            frac = (src_pix_f - row_lo)[:, None, None].astype(np.float32)
 
+            # Ряды исходных тайлов, задействованные в этой полосе (обычно 1–2)
+            needed = sorted(set(
+                int(r) // TILE_SIZE
+                for r in np.unique(np.concatenate([row_lo, row_hi]))
+            ))
+
+            # Вытесняем из кеша ряды тайлов, которые уже не понадобятся
+            stale = [k for k in src_cache if k[1] - min_y_src < needed[0]]
+            for k in stale:
+                del src_cache[k]
+            if stale:
+                gc.collect()
+
+            # Подгружаем недостающие ряды из файла
+            for src_ty in needed:
+                y_abs = min_y_src + src_ty
+                for tx in range(w_tiles):
+                    key = (min_x + tx, y_abs)
+                    if key not in src_cache:
+                        entry = tile_index.get(key)
+                        if entry is None:
+                            src_cache[key] = None
+                        else:
+                            offset, size = entry
+                            jnx_f.seek(offset)
+                            jpeg = b'\xff\xd8' + jnx_f.read(size)
+                            src_cache[key] = np.array(
+                                Image.open(io.BytesIO(jpeg)).convert('RGB')
+                            )
+
+            # Строим мини-мозаику только из нужных рядов тайлов
+            local = {r: i for i, r in enumerate(needed)}  # ряд → локальный индекс
+            n_loc = len(needed)
+            mini = np.zeros((n_loc * TILE_SIZE, w_tiles * TILE_SIZE, 3), dtype=np.uint8)
+            mini_mask = np.zeros((n_loc * TILE_SIZE, w_tiles * TILE_SIZE), dtype=bool)
+            for src_ty in needed:
+                r0 = local[src_ty] * TILE_SIZE
+                y_abs = min_y_src + src_ty
+                for tx in range(w_tiles):
+                    arr = src_cache.get((min_x + tx, y_abs))
+                    if arr is not None:
+                        c0 = tx * TILE_SIZE
+                        mini[r0:r0 + TILE_SIZE, c0:c0 + TILE_SIZE] = arr
+                        mini_mask[r0:r0 + TILE_SIZE, c0:c0 + TILE_SIZE] = True
+
+            # Переводим абсолютные пиксельные строки в локальные индексы мини-мозаики
+            local_lo = np.zeros(TILE_SIZE, dtype=np.int32)
+            local_hi = np.zeros(TILE_SIZE, dtype=np.int32)
+            for src_ty in needed:
+                base = local[src_ty] * TILE_SIZE
+                m_lo = row_lo // TILE_SIZE == src_ty
+                m_hi = row_hi // TILE_SIZE == src_ty
+                local_lo[m_lo] = base + row_lo[m_lo] % TILE_SIZE
+                local_hi[m_hi] = base + row_hi[m_hi] % TILE_SIZE
+
+            band = (
+                mini[local_lo].astype(np.float32) * (1 - frac) +
+                mini[local_hi].astype(np.float32) * frac
+            ).astype(np.uint8)
+            band_mask = mini_mask[local_lo] | mini_mask[local_hi]
+            del mini, mini_mask
+
+            for i in range(w_tiles):
+                col_start = i * TILE_SIZE
+                if not band_mask[:, col_start:col_start + TILE_SIZE].any():
+                    continue
+                buf = io.BytesIO()
+                Image.fromarray(band[:, col_start:col_start + TILE_SIZE]).save(
+                    buf, format='JPEG', quality=88
+                )
+                tms_row = (2 ** zoom - 1) - (min_y_tgt + j)
+                conn.execute(
+                    "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+                    (zoom, min_x + i, tms_row, sqlite3.Binary(buf.getvalue()))
+                )
+                total += 1
+
+            del band, band_mask
+            progress(j + 1, h_tiles_tgt, prefix='  перепроекция')
+
+    gc.collect()
     log(f"Уровень z={zoom}: перепроецировано {w_tiles}x{h_tiles_src} -> {w_tiles}x{h_tiles_tgt} тайлов ({total} с данными)")
     return total
 
