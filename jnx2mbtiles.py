@@ -307,7 +307,7 @@ def build_level(conn, jnx_path, level, projection, progress_every=200):
             )
             row_lo = np.floor(src_pix_f).astype(np.int32)
             row_hi = np.clip(row_lo + 1, 0, h_tiles_src * TILE_SIZE - 1).astype(np.int32)
-            frac = (src_pix_f - row_lo)[:, None, None].astype(np.float32)
+            frac = (src_pix_f - row_lo)[:, None, None]
 
             # Ряды исходных тайлов, задействованные в этой полосе (обычно 1–2)
             needed = sorted(set(
