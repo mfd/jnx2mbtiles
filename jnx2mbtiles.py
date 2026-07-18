@@ -35,6 +35,7 @@ TILE_SIZE = 256
 
 VERBOSE = False  # управляется флагом --verbose
 progress_hook = None  # callable(current, total, prefix) — устанавливается извне
+level_hook = None    # callable(zoom, level_idx, total_levels, projection) — устанавливается извне
 
 
 def progress(current, total, prefix=''):
@@ -439,7 +440,12 @@ def convert(jnx_path, out_path, name=None, projection=None):
 
     total = 0
     minzoom, maxzoom = None, None
-    for lvl in levels:
+    for lvl_idx, lvl in enumerate(levels):
+        if level_hook is not None:
+            try:
+                level_hook(lvl['level_zoom'], lvl_idx, len(levels), projection)
+            except Exception:
+                pass
         n = build_level(conn, jnx_path, lvl, projection)
         total += n
         if n:

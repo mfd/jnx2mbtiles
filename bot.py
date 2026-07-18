@@ -130,6 +130,18 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         started = time.time()
         _last = [0.0]
         _lock = threading.Lock()
+        _level: dict = {}  # zoom, idx, total, projection — заполняется level_hook
+
+        _PROJ_RU = {
+            'spherical':    'сферическая (Google/OSM)',
+            'ellipsoidal':  'эллипсоидальная (Яндекс)',
+        }
+
+        def _on_level(zoom, level_idx, total_levels, projection):
+            _level['zoom'] = zoom
+            _level['idx'] = level_idx + 1
+            _level['total'] = total_levels
+            _level['proj'] = _PROJ_RU.get(projection, projection)
 
         def _on_progress(current, total, prefix=''):
             now = time.time()
@@ -138,24 +150,30 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                     return
                 _last[0] = now
             pct = current / total if total else 1.0
-            filled = int(20 * pct)
+            filled = max(1 if pct > 0 else 0, int(20 * pct))
             bar = '█' * filled + '░' * (20 - filled)
             elapsed = int(now - started)
             rss, swap = _proc_mem()
+            proj = _level.get('proj', '…')
+            zoom = _level.get('zoom', '?')
+            lvl_str = f"{_level['idx']}/{_level['total']}" if _level else '…'
             text = (
-                f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)…\n'
-                f'{prefix.strip()} [{bar}] {pct * 100:.0f}%\n'
+                f'Конвертирую {doc.file_name} ({size_mb:.1f} МБ)\n'
+                f'Проекция: {proj}\n'
+                f'z={zoom} [{lvl_str}]  {prefix.strip()} [{bar}] {pct * 100:.0f}%\n'
                 f'⏱ {elapsed // 60:02d}:{elapsed % 60:02d}  '
                 f'RAM {rss:.0f} МБ  swap {swap:.0f} МБ'
             )
             asyncio.run_coroutine_threadsafe(_safe_edit(msg, text), loop)
 
+        jnx2mbtiles.level_hook = _on_level
         jnx2mbtiles.progress_hook = _on_progress
         try:
             await loop.run_in_executor(None, _run_convert, str(jnx_path), str(out_path))
         except SystemExit as exc:
             raise RuntimeError(f'jnx2mbtiles завершился с кодом {exc.code}') from exc
         finally:
+            jnx2mbtiles.level_hook = None
             jnx2mbtiles.progress_hook = None
 
         out_mb = out_path.stat().st_size / 1024 / 1024
