@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
 Telegram bot for jnx → mbtiles conversion.
-Send a .jnx file — get a .mbtiles file back.
+Send a .jnx file — get a .mbtiles file back via Telegram + optional HTTP download link.
 
 Requires a local Telegram Bot API server (LOCAL_API_URL) to lift the 50 MB limit.
 
 Environment variables:
   BOT_TOKEN      (required) Telegram bot token from @BotFather
   LOCAL_API_URL  (optional) Local Bot API server, e.g. http://localhost:8081
+  VPS_URL        (optional) Public base URL for download links, e.g. http://1.2.3.4:8080
+  HTTP_PORT      (optional) Port for the download HTTP server, default 8080
+  EXPIRE_HOURS   (optional) How long download links stay alive, default 2
 """
 
 import asyncio
 import logging
 import os
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -29,9 +35,48 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ['BOT_TOKEN']
 LOCAL_API_URL = os.environ.get('LOCAL_API_URL', '').rstrip('/')
+VPS_URL = os.environ.get('VPS_URL', '').rstrip('/')
+HTTP_PORT = int(os.environ.get('HTTP_PORT', 8080))
+EXPIRE_SECONDS = int(os.environ.get('EXPIRE_HOURS', 2)) * 3600
+EXPIRE_HOURS = EXPIRE_SECONDS // 3600
 
 _tmpdir = tempfile.mkdtemp(prefix='jnx2mb_')
 
+# token -> {'out_path': Path, 'expires': float}
+_downloads: dict[str, dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# HTTP download server
+# ---------------------------------------------------------------------------
+
+async def http_download(request: web.Request) -> web.Response:
+    token = request.match_info['token']
+    entry = _downloads.get(token)
+    if not entry:
+        return web.Response(status=404, text='Not found or expired\n')
+    if time.time() > entry['expires']:
+        _downloads.pop(token, None)
+        return web.Response(status=410, text='Link expired\n')
+    out_path: Path = entry['out_path']
+    if not out_path.exists():
+        return web.Response(status=410, text='File already deleted\n')
+    return web.FileResponse(
+        out_path,
+        headers={'Content-Disposition': f'attachment; filename="{out_path.name}"'},
+    )
+
+
+def _schedule_download_cleanup(token: str) -> None:
+    entry = _downloads.pop(token, None)
+    if entry:
+        entry['out_path'].unlink(missing_ok=True)
+        logger.info('Cleaned up download token %s', token)
+
+
+# ---------------------------------------------------------------------------
+# Telegram handlers
+# ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text('Пришлите .jnx файл — получите .mbtiles.')
@@ -72,12 +117,25 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.delete()
         logger.info('Done: %s → %s (%.1f MB)', doc.file_name, out_path.name, out_mb)
 
+        if VPS_URL:
+            token = uuid.uuid4().hex
+            _downloads[token] = {'out_path': out_path, 'expires': time.time() + EXPIRE_SECONDS}
+            dl_url = f'{VPS_URL}/download/{token}/{out_path.name}'
+            await ctx.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f'Ссылка для скачивания (действует {EXPIRE_HOURS}ч):\n`{dl_url}`',
+                parse_mode='Markdown',
+            )
+            loop.call_later(EXPIRE_SECONDS, _schedule_download_cleanup, token)
+        else:
+            out_path.unlink(missing_ok=True)
+
     except Exception as exc:
         logger.exception('Failed for %s', doc.file_name)
         await msg.edit_text(f'Ошибка: {exc}')
+        out_path.unlink(missing_ok=True)
     finally:
         jnx_path.unlink(missing_ok=True)
-        out_path.unlink(missing_ok=True)
 
 
 def _run_convert(jnx_path: str, out_path: str) -> None:
@@ -85,7 +143,19 @@ def _run_convert(jnx_path: str, out_path: str) -> None:
     jnx2mbtiles.convert(jnx_path, out_path, name=None, projection=None)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 async def run_all() -> None:
+    if VPS_URL:
+        http_app = web.Application()
+        http_app.router.add_get('/download/{token}/{filename}', http_download)
+        runner = web.AppRunner(http_app)
+        await runner.setup()
+        await web.TCPSite(runner, '0.0.0.0', HTTP_PORT).start()
+        logger.info('HTTP download server on port %d', HTTP_PORT)
+
     builder = Application.builder().token(BOT_TOKEN)
     if LOCAL_API_URL:
         builder = builder.base_url(f'{LOCAL_API_URL}/bot').local_mode(True)
@@ -108,6 +178,8 @@ async def run_all() -> None:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        if VPS_URL:
+            await runner.cleanup()
 
 
 if __name__ == '__main__':

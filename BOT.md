@@ -121,7 +121,24 @@ pip install -r requirements.txt
 
 ---
 
-## Шаг 8. Заполнить .env
+## Шаг 8. Открыть порт 8080 для скачивания
+
+Бот дополнительно отправляет HTTP-ссылку на скачивание. Для этого нужен открытый порт.
+
+**На сервере (iptables):**
+```bash
+sudo apt install -y netfilter-persistent iptables-persistent
+sudo iptables -I INPUT -p tcp --dport 8080 -j ACCEPT
+sudo netfilter-persistent save
+```
+
+**В Oracle Cloud Console** (если Oracle Cloud):  
+Networking → VCN → Security Lists → Default → Ingress Rules → Add:
+- Source: `0.0.0.0/0`, Protocol: TCP, Destination port: `8080`
+
+---
+
+## Шаг 9. Заполнить .env
 
 ```bash
 cp .env.example .env
@@ -131,6 +148,7 @@ nano .env
 ```env
 BOT_TOKEN=<токен от @BotFather>
 LOCAL_API_URL=http://localhost:8081
+VPS_URL=http://<публичный-IP>:8080
 ```
 
 `Ctrl+O` → Enter → `Ctrl+X`
